@@ -10,110 +10,112 @@ const cors       = require('cors');
 const PORT    = parseInt(process.env.PORT || '5000', 10);
 const IS_PROD = process.env.NODE_ENV === 'production';
 
-// ── MONGODB URI ───────────────────────────────────────────────
-const MONGO_URI = process.env.MONGODB_URI;
-if (!MONGO_URI) {
-  console.error('FATAL: MONGODB_URI manquant dans .env');
-  process.exit(1);
-}
-
-// ── CORS ─────────────────────────────────────────────────────
-const ALLOWED = (process.env.CLIENT_URL || '')
-  .split(',').map(s => s.trim()).filter(Boolean)
-  .concat([
-    'http://localhost:5173',
-    'http://localhost:5174',
-    'http://localhost:3000',
-    'http://localhost:4173',
-  ]);
-
-const originOK = (origin) => {
-  if (!origin) return true;
-  if (ALLOWED.some(a => origin.startsWith(a))) return true;
-  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return true;
-  if (/\.netlify\.app$/.test(origin))  return true;
-  if (/\.railway\.app$/.test(origin))  return true;
-  if (/\.up\.railway\.app$/.test(origin)) return true;
-  return false;
-};
-
-// ── APP ──────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// 1. EXPRESS + HTTP SERVER DÉMARRÉS IMMÉDIATEMENT
+// ─────────────────────────────────────────────
 const app    = express();
 const server = http.createServer(app);
-const io     = new Server(server, {
-  cors: { origin: (o, cb) => originOK(o) ? cb(null, true) : cb(new Error('CORS: ' + o)), credentials: true },
-  pingTimeout:  60000,
+
+// Socket.io
+const io = new Server(server, {
+  cors: { origin: "*", credentials: true },
+  pingTimeout: 60000,
   pingInterval: 25000,
 });
 
-app.use(cors({ origin: (o, cb) => originOK(o) ? cb(null, true) : cb(new Error('CORS: ' + o)), credentials: true }));
+// Middlewares
+app.use(cors({ origin: "*", credentials: true }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// ── HEALTHCHECK (Railway) — AVANT LA DB ───────────────────────
-app.get('/health', (_, res) => res.json({
-  ok:   true,
-  db:   mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
-  env:  process.env.NODE_ENV || 'development',
-  time: new Date().toISOString(),
-}));
+// ─────────────────────────────────────────────
+// 2. HEALTHCHECK — DISPONIBLE IMMÉDIATEMENT
+// ─────────────────────────────────────────────
+app.get('/health', (_, res) => {
+  res.json({
+    ok: true,
+    db: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+    env: process.env.NODE_ENV || 'development',
+    time: new Date().toISOString(),
+  });
+});
 
-// ── MONGODB avec retry ───────────────────────────────────────
+// ─────────────────────────────────────────────
+// 3. LE SERVEUR ÉCOUTE AVANT LA DB
+// ─────────────────────────────────────────────
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Aide CI API démarrée sur port ${PORT} [${IS_PROD ? 'prod' : 'dev'}]`);
+});
+
+// Gestion erreurs serveur
+server.on('error', err => {
+  console.error("Erreur serveur:", err.message);
+  process.exit(1);
+});
+
+// ─────────────────────────────────────────────
+// 4. CONNEXION MONGODB EN ARRIÈRE‑PLAN (RETRY)
+// ─────────────────────────────────────────────
+const MONGO_URI = process.env.MONGODB_URI;
+if (!MONGO_URI) {
+  console.error("FATAL: MONGODB_URI manquant");
+  process.exit(1);
+}
+
 async function connectDB(attempt = 1) {
-  const MAX = 8;
+  const MAX = 20;
+
   try {
     await mongoose.connect(MONGO_URI, {
       serverSelectionTimeoutMS: 15000,
-      socketTimeoutMS:          45000,
-      connectTimeoutMS:         15000,
-      maxPoolSize:              10,
+      connectTimeoutMS: 15000,
+      socketTimeoutMS: 45000,
+      maxPoolSize: 10,
     });
-    console.log('MongoDB connecté');
+
+    console.log("MongoDB connecté");
+    loadApp(); // Charger routes + sockets une fois DB OK
+
   } catch (err) {
     console.error(`MongoDB tentative ${attempt}/${MAX}: ${err.message}`);
-    if (attempt >= MAX) { console.error('FATAL: MongoDB inaccessible'); process.exit(1); }
-    await new Promise(r => setTimeout(r, Math.min(attempt * 2000, 12000)));
-    return connectDB(attempt + 1);
+
+    if (attempt >= MAX) {
+      console.error("FATAL: MongoDB inaccessible après plusieurs tentatives");
+      return;
+    }
+
+    setTimeout(() => connectDB(attempt + 1), 3000);
   }
 }
 
-mongoose.connection.on('disconnected', () => console.warn('MongoDB déconnecté — reconnexion auto...'));
-mongoose.connection.on('reconnected',  () => console.log('MongoDB reconnecté'));
+connectDB();
 
-// ── ROUTES & SOCKET (chargés APRÈS DB) ───────────────────────
+// ─────────────────────────────────────────────
+// 5. ROUTES + SOCKET.IO (APRÈS DB)
+// ─────────────────────────────────────────────
 function loadApp() {
+  console.log("Chargement des routes et sockets…");
+
   app.use('/api', require('./src/routes/index'));
   require('./src/socket/index')(io);
 
-  app.use((req, res) => res.status(404).json({ success: false, message: 'Route introuvable' }));
+  app.use((req, res) => res.status(404).json({ success: false, message: "Route introuvable" }));
 
   app.use((err, req, res, _next) => {
-    console.error('Express error:', err.message);
+    console.error("Express error:", err.message);
     res.status(500).json({ success: false, message: err.message });
   });
 }
 
-// ── DÉMARRAGE ─────────────────────────────────────────────────
-async function start() {
-  await connectDB();
-  loadApp();
-
-  server.listen(PORT, '0.0.0.0', () =>
-    console.log(`Aide CI API sur port ${PORT} [${IS_PROD ? 'prod' : 'dev'}]`)
-  );
-
-  server.on('error', err => {
-    if (err.code === 'EADDRINUSE')
-      console.error(`ERREUR: port ${PORT} déjà utilisé.`);
-    else console.error('Erreur serveur:', err.message);
-    process.exit(1);
-  });
-}
-
-// ── ARRET PROPRE ──────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// 6. SHUTDOWN PROPRE
+// ─────────────────────────────────────────────
 const shutdown = (sig) => {
-  console.log(`\n${sig} — arrêt propre...`);
-  server.close(async () => { await mongoose.connection.close(); process.exit(0); });
+  console.log(`${sig} — arrêt propre…`);
+  server.close(async () => {
+    await mongoose.connection.close();
+    process.exit(0);
+  });
   setTimeout(() => process.exit(1), 10000);
 };
 
@@ -121,5 +123,3 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
 process.on('uncaughtException',  e => { console.error('uncaughtException:',  e); process.exit(1); });
 process.on('unhandledRejection', e => { console.error('unhandledRejection:', e); process.exit(1); });
-
-start();
