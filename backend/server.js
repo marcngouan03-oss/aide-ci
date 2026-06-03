@@ -50,7 +50,7 @@ app.use(cors({ origin: (o, cb) => originOK(o) ? cb(null, true) : cb(new Error('C
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// Health check — disponible AVANT la connexion DB
+// ── HEALTHCHECK (Railway) — AVANT LA DB ───────────────────────
 app.get('/health', (_, res) => res.json({
   ok:   true,
   db:   mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
@@ -68,7 +68,7 @@ async function connectDB(attempt = 1) {
       connectTimeoutMS:         15000,
       maxPoolSize:              10,
     });
-    console.log('MongoDB connecte');
+    console.log('MongoDB connecté');
   } catch (err) {
     console.error(`MongoDB tentative ${attempt}/${MAX}: ${err.message}`);
     if (attempt >= MAX) { console.error('FATAL: MongoDB inaccessible'); process.exit(1); }
@@ -77,31 +77,34 @@ async function connectDB(attempt = 1) {
   }
 }
 
-mongoose.connection.on('disconnected', () => console.warn('MongoDB deconnecte — reconnexion auto...'));
-mongoose.connection.on('reconnected',  () => console.log('MongoDB reconnecte'));
+mongoose.connection.on('disconnected', () => console.warn('MongoDB déconnecté — reconnexion auto...'));
+mongoose.connection.on('reconnected',  () => console.log('MongoDB reconnecté'));
 
-// ── ROUTES & SOCKET (charges APRES DB) ───────────────────────
+// ── ROUTES & SOCKET (chargés APRÈS DB) ───────────────────────
 function loadApp() {
   app.use('/api', require('./src/routes/index'));
   require('./src/socket/index')(io);
+
   app.use((req, res) => res.status(404).json({ success: false, message: 'Route introuvable' }));
-  // eslint-disable-next-line no-unused-vars
+
   app.use((err, req, res, _next) => {
     console.error('Express error:', err.message);
     res.status(500).json({ success: false, message: err.message });
   });
 }
 
-// ── DEMARRAGE ─────────────────────────────────────────────────
+// ── DÉMARRAGE ─────────────────────────────────────────────────
 async function start() {
   await connectDB();
   loadApp();
+
   server.listen(PORT, '0.0.0.0', () =>
     console.log(`Aide CI API sur port ${PORT} [${IS_PROD ? 'prod' : 'dev'}]`)
   );
+
   server.on('error', err => {
     if (err.code === 'EADDRINUSE')
-      console.error(`ERREUR: port ${PORT} deja utilise. Arretez le processus puis relancez.`);
+      console.error(`ERREUR: port ${PORT} déjà utilisé.`);
     else console.error('Erreur serveur:', err.message);
     process.exit(1);
   });
@@ -109,10 +112,11 @@ async function start() {
 
 // ── ARRET PROPRE ──────────────────────────────────────────────
 const shutdown = (sig) => {
-  console.log(`\n${sig} — arret propre...`);
+  console.log(`\n${sig} — arrêt propre...`);
   server.close(async () => { await mongoose.connection.close(); process.exit(0); });
   setTimeout(() => process.exit(1), 10000);
 };
+
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
 process.on('uncaughtException',  e => { console.error('uncaughtException:',  e); process.exit(1); });
